@@ -4,54 +4,54 @@ Reusable GitHub Actions workflows, called from other repositories via `workflow_
 
 | Workflow | Purpose |
 | --- | --- |
-| [`terraform.yml`](.github/workflows/terraform.yml) | Terraform CI/CD: fmt, init, validate, plan (with PR comment), optional gated apply |
+| [`terraform.yml`](.github/workflows/terraform.yml) | Terraform CI: credential-free init, validate and optional `terraform test` across one or more root modules |
 | [`pre-commit.yml`](.github/workflows/pre-commit.yml) | Runs all pre-commit hooks against the full repository |
 | [`release.yml`](.github/workflows/release.yml) | Semver tagging on CD: bumps from conventional commits, pushes the tag, creates a GitHub release |
 
-## Terraform CI/CD
+## Terraform CI
 
-Plans on every run and comments the plan on pull requests. When `apply: true`, the saved plan is applied in a second job, optionally gated behind a GitHub environment's required reviewers.
+Credential-free validation of every root module in the calling repository: `terraform init -backend=false` then `terraform validate`, one matrix leg per directory, plus an optional `terraform test` job for repos whose tests mock their providers.
 
-Authentication is to Azure via OIDC federated credentials — no long-lived secrets. The workflow logs in with `azure/login` and exports the `ARM_*` environment variables so both the `azurerm` provider and backend authenticate with OIDC.
+There is no plan or apply job, deliberately. A plan needs Azure credentials and only succeeds once the configuration's dependencies already exist — root modules resolve each other with data sources, so a plan against a not-yet-applied dependency fails at plan time and reports a CI failure for something that is not a defect. Applies are run by hand against remote state.
+
+`-backend=false` is what keeps this credential-free: a repo whose `backend.tf` points at a real remote state account still validates on a fresh clone with no Azure auth.
 
 ```yaml
-name: Terraform
+name: ci-terraform
 
 on:
   pull_request:
-  push:
-    branches:
-      - main
+    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   terraform:
-    uses: jay-withers/template-pipelines/.github/workflows/terraform.yml@main
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: jay-withers/workflows/.github/workflows/terraform.yml@main
     with:
-      working-directory: terraform
-      apply: ${{ github.ref == 'refs/heads/main' }}
-      environment: production
-      azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
-      azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
-      azure-subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      directories: '["terraform/management", "terraform/connectivity"]'
 ```
 
 ### Terraform inputs
 
 | Input | Default | Description |
 | --- | --- | --- |
-| `working-directory` | `.` | Directory containing the Terraform code |
-| `apply` | `false` | Run `terraform apply` on the saved plan after a successful plan |
-| `environment` | `""` | GitHub environment for the apply job — set required reviewers on it to gate applies |
-| `azure-client-id` | required | Azure app registration / managed identity client ID for OIDC |
-| `azure-tenant-id` | required | Azure tenant ID |
-| `azure-subscription-id` | required | Azure subscription ID |
+| `directories` | `["terraform"]` | JSON array of root-module directories to init and validate, relative to the repo root. One matrix leg each |
+| `test-directories` | `[]` | JSON array of directories to run `terraform test` in. Empty skips the test job |
+| `runs-on` | `ubuntu-latest` | Runner label for every job |
 
 Notes:
 
-- The Terraform version comes from a `.terraform-version` file (the [tfenv](https://github.com/tfutils/tfenv) convention) in the calling repository — looked up in `working-directory` first, then the repo root. Renovate's built-in `terraform-version` manager (part of `config:recommended`) keeps it bumped.
-- The plan job needs `pull-requests: write` (PR comments) and `id-token: write` (OIDC); the caller's `GITHUB_TOKEN` must not restrict these below what the reusable workflow requests.
-- The plan file is uploaded as a short-lived artifact and applied verbatim, so what was reviewed is what gets applied. Plan files can contain sensitive values — keep this repo's callers private if that matters.
-- The Terraform backend is expected to be configured in code (an `azurerm` backend block; `ARM_USE_OIDC=true` is exported so it can use OIDC too).
+- **The required status check is `<caller job id> / Terraform`** — for the example above, `terraform / Terraform`. A reusable workflow's checks are namespaced by the calling job's id, the same way `pre-commit.yml` reports as `pre-commit / Pre-commit`. Update branch protection when adopting this, or the required check hangs pending forever.
+- The caller must grant the calling job `pull-requests: read`; the path filter that decides whether the PR touches Terraform runs inside this workflow.
+- Path filtering lives inside this workflow rather than on the caller's trigger, so the workflow always runs and the gate job always reports. A workflow skipped by a top-level paths filter leaves its required check pending and blocks the merge. The filter matches `terraform/**`, `.terraform-version` and `.github/workflows/ci-terraform.yml`.
+- The gate job treats *skipped* as success, so a PR touching no Terraform is not blocked.
+- The Terraform version comes from a `.terraform-version` file (the [tfenv](https://github.com/tfutils/tfenv) convention) — looked up in each directory first, then the repo root. Renovate's built-in `terraform-version` manager (part of `config:recommended`) keeps it bumped.
+- `fmt`, TFLint and Checkov are not run here — they belong to `pre-commit.yml`.
 
 ## Pre-commit CI
 

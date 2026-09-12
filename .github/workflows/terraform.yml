@@ -1,71 +1,89 @@
 name: Terraform
 
+# Credential-free Terraform CI: proves every root module in the calling repo
+# initialises, validates, and (optionally) passes its `terraform test` suite.
+#
+# There is deliberately no plan or apply job. Plans need Azure credentials and
+# only succeed once a configuration's dependencies already exist — components
+# and root modules resolve each other with data sources, so a plan against a
+# not-yet-applied dependency fails at plan time and reports a CI failure for
+# something that is not a defect. Applies are run by hand against remote state.
+# Restore a plan job here only alongside an identity that actually holds read
+# across the target subscription.
+
 on:
   workflow_call:
     inputs:
-      working-directory:
-        description: Directory containing the Terraform code
-        type: string
-        default: "."
-      environment:
+      directories:
         description: >-
-          GitHub environment used for the apply job. Configure it with required
-          reviewers to enforce the manual approval gate between plan and apply.
+          JSON array of root-module directories to init and validate, relative
+          to the repository root. One matrix leg each.
         type: string
-        default: ""
-      azure-client-id:
-        description: Client ID of the Azure app registration / managed identity to authenticate via OIDC
+        default: '["terraform"]'
+      test-directories:
+        description: >-
+          JSON array of directories to run `terraform test` in. Empty skips the
+          test job entirely. Tests must mock their providers — this workflow
+          has no cloud credentials.
         type: string
-        required: true
-      azure-tenant-id:
-        description: Azure tenant ID
+        default: "[]"
+      runs-on:
+        description: Runner label for every job.
         type: string
-        required: true
-      azure-subscription-id:
-        description: Azure subscription ID
-        type: string
-        required: true
+        default: ubuntu-latest
 
 jobs:
-  plan:
-    name: Plan
-    runs-on: ubuntu-latest
+  # Path filtering lives here rather than on the caller's workflow trigger so
+  # the workflow always runs and the gate job below always reports. A workflow
+  # skipped by a top-level paths filter leaves its required check pending
+  # forever and blocks the merge.
+  changes:
+    name: Detect changes
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      pull-requests: read
+    outputs:
+      terraform: ${{ steps.filter.outputs.terraform }}
+    steps:
+      - name: Detect Terraform changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          filters: |
+            terraform:
+              - 'terraform/**'
+              - '.terraform-version'
+              - '.github/workflows/ci-terraform.yml'
+
+  validate:
+    name: Validate (${{ matrix.directory }})
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true'
+    runs-on: ${{ inputs.runs-on }}
+    strategy:
+      # Off so each directory reports independently rather than the first
+      # failure masking the rest.
+      fail-fast: false
+      matrix:
+        directory: ${{ fromJSON(inputs.directories) }}
     permissions:
       contents: read
-      id-token: write
-      pull-requests: write
     defaults:
       run:
-        working-directory: ${{ inputs.working-directory }}
+        working-directory: ${{ matrix.directory }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Configure Azure credentials
-        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
-        with:
-          client-id: ${{ inputs.azure-client-id }}
-          tenant-id: ${{ inputs.azure-tenant-id }}
-          subscription-id: ${{ inputs.azure-subscription-id }}
-
-      - name: Export Azure provider environment
-        run: |
-          {
-            echo "ARM_CLIENT_ID=${{ inputs.azure-client-id }}"
-            echo "ARM_TENANT_ID=${{ inputs.azure-tenant-id }}"
-            echo "ARM_SUBSCRIPTION_ID=${{ inputs.azure-subscription-id }}"
-            echo "ARM_USE_OIDC=true"
-          } >> "$GITHUB_ENV"
-
-      - name: Read Terraform version
-        id: terraform-version
+      - name: Resolve Terraform version
+        id: tfversion
         run: |
           if [ -f .terraform-version ]; then
             file=.terraform-version
           elif [ -f "$GITHUB_WORKSPACE/.terraform-version" ]; then
             file="$GITHUB_WORKSPACE/.terraform-version"
           else
-            echo "::error::No .terraform-version file found in the working directory or the repo root"
+            echo "::error::No .terraform-version file found in ${{ matrix.directory }} or the repo root"
             exit 1
           fi
           echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
@@ -73,122 +91,49 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
-          terraform_version: ${{ steps.terraform-version.outputs.version }}
+          terraform_version: ${{ steps.tfversion.outputs.version }}
+          terraform_wrapper: false
 
-      - name: Terraform Format
-        id: fmt
-        run: terraform fmt -check -recursive
+      # -backend=false is what keeps this credential-free: it initialises
+      # modules and providers without touching the configured backend, so a
+      # repo whose backend.tf points at a real remote state account still
+      # validates on a fork or a fresh clone with no Azure auth at all.
+      - name: Terraform init
+        run: terraform init -input=false -backend=false
 
-      - name: Terraform Init
-        id: init
-        run: terraform init -input=false
-
-      - name: Terraform Validate
-        id: validate
+      - name: Terraform validate
         run: terraform validate -no-color
 
-      - name: Terraform Plan
-        id: plan
-        run: terraform plan -no-color -input=false -out=tfplan
-
-      - name: Upload plan
-        if: github.event_name != 'pull_request'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: tfplan
-          path: ${{ inputs.working-directory }}/tfplan
-          retention-days: 5
-
-      - name: Comment plan on PR
-        if: github.event_name == 'pull_request' && always()
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
-        env:
-          PLAN: ${{ steps.plan.outputs.stdout }}
-        with:
-          script: |
-            const marker = '<!-- terraform-plan -->';
-            const plan = process.env.PLAN || 'Plan failed - see workflow logs.';
-            const truncated = plan.length > 60000 ? plan.slice(0, 60000) + '\n... (truncated)' : plan;
-            const body = `${marker}
-            #### Terraform \`${{ inputs.working-directory }}\`
-            | Step | Result |
-            |------|--------|
-            | Format | \`${{ steps.fmt.outcome }}\` |
-            | Init | \`${{ steps.init.outcome }}\` |
-            | Validate | \`${{ steps.validate.outcome }}\` |
-            | Plan | \`${{ steps.plan.outcome }}\` |
-
-            <details><summary>Show plan</summary>
-
-            \`\`\`terraform
-            ${truncated}
-            \`\`\`
-
-            </details>`;
-
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            const existing = comments.find(c => c.body.includes(marker));
-            if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
-            }
-
-  apply:
-    name: Apply
-    if: github.event_name != 'pull_request'
-    needs: plan
-    runs-on: ubuntu-latest
-    environment: ${{ inputs.environment }}
+  # Skipped unless the caller passes directories. The `if` guard matters: an
+  # empty matrix vector is a workflow error, so the job must not be created at
+  # all when test-directories is the default "[]".
+  test:
+    name: Test (${{ matrix.directory }})
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true' && inputs.test-directories != '[]'
+    runs-on: ${{ inputs.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        directory: ${{ fromJSON(inputs.test-directories) }}
     permissions:
       contents: read
-      id-token: write
     defaults:
       run:
-        working-directory: ${{ inputs.working-directory }}
+        working-directory: ${{ matrix.directory }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: Configure Azure credentials
-        uses: azure/login@7ddb5af1ef8758cf1353cf3b42f940aee27ba21c # v3.0.2
-        with:
-          client-id: ${{ inputs.azure-client-id }}
-          tenant-id: ${{ inputs.azure-tenant-id }}
-          subscription-id: ${{ inputs.azure-subscription-id }}
-
-      - name: Export Azure provider environment
-        run: |
-          {
-            echo "ARM_CLIENT_ID=${{ inputs.azure-client-id }}"
-            echo "ARM_TENANT_ID=${{ inputs.azure-tenant-id }}"
-            echo "ARM_SUBSCRIPTION_ID=${{ inputs.azure-subscription-id }}"
-            echo "ARM_USE_OIDC=true"
-          } >> "$GITHUB_ENV"
-
-      - name: Read Terraform version
-        id: terraform-version
+      - name: Resolve Terraform version
+        id: tfversion
         run: |
           if [ -f .terraform-version ]; then
             file=.terraform-version
           elif [ -f "$GITHUB_WORKSPACE/.terraform-version" ]; then
             file="$GITHUB_WORKSPACE/.terraform-version"
           else
-            echo "::error::No .terraform-version file found in the working directory or the repo root"
+            echo "::error::No .terraform-version file found in ${{ matrix.directory }} or the repo root"
             exit 1
           fi
           echo "version=$(cat "$file")" >> "$GITHUB_OUTPUT"
@@ -196,16 +141,33 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
-          terraform_version: ${{ steps.terraform-version.outputs.version }}
+          terraform_version: ${{ steps.tfversion.outputs.version }}
+          terraform_wrapper: false
 
-      - name: Terraform Init
-        run: terraform init -input=false
+      - name: Terraform init
+        run: terraform init -input=false -backend=false
 
-      - name: Download plan
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: tfplan
-          path: ${{ inputs.working-directory }}
+      - name: Terraform test
+        run: terraform test -no-color
 
-      - name: Terraform Apply
-        run: terraform apply -input=false tfplan
+  # Single always-reporting job for the caller to mark as its required status
+  # check. Fails only if validate or test actually failed — skipped (the PR
+  # touches no Terraform) counts as success, so non-Terraform PRs are not
+  # blocked. The check context the caller must require is
+  # "<caller job id> / Terraform".
+  terraform:
+    name: Terraform
+    needs: [validate, test]
+    if: always()
+    runs-on: ${{ inputs.runs-on }}
+    steps:
+      - name: Verify Terraform jobs
+        env:
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+        run: |
+          echo "validate=$VALIDATE_RESULT test=$TEST_RESULT"
+          if [ "$VALIDATE_RESULT" = "failure" ] || [ "$TEST_RESULT" = "failure" ]; then
+            echo "::error::A Terraform job failed."
+            exit 1
+          fi
